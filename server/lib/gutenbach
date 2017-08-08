@@ -24,25 +24,32 @@ use LWP::UserAgent;
 use Data::Dumper;
 use IPC::Open2;
 use English;
+use Scalar::Util qw(looks_like_number);
 
-use vars qw/$zephyr_class $host $queue $mixer $channel/;
+use vars qw/$zephyr_class $host $queue $mixer $channel $http_password/;
 
+# the first config file assigns values to the first five variables above;
+# the second config file assigns a value to the last variable.
 require "/usr/lib/gutenbach/config/gutenbach-filter-config.pl" or die "Unable to load configuration";
+require "/usr/lib/gutenbach/config/gutenbach-http-password.pl" or die "Unable to load http password";
+
+my $COPIES_SENTINEL = 42;
+my @start_synonyms = qw(start from begin f b);
+my @stop_synonyms = qw(stop end to til until e t);
+# for sketchy regex interpolation later:
+my $start_ors = join '|', @start_synonyms;
+my $stop_ors  = join '|', @stop_synonyms;
 
 my $ua = new LWP::UserAgent;
 
 # This variable contains the pid of the child process (which runs
-# mplayer) once it has been forked, so that we can kill it on SIGTERM
+# vlc) once it has been forked, so that we can kill it on SIGTERM
 my $pid;
 
 # Replace STDERR with a log file in /tmp.
 open(CUPS, ">&STDERR") or die "Unable to copy CUPS filehandle";
 close(STDERR);
 open(STDERR, ">>", "/tmp/gutenbach.log") or warn "Couldn't open log: $!";
-
-# Set the TERM environment (for the benefit of mplayer?)
-# I don't know why we do this --quentin
-$ENV{"TERM"}="vt100";
 
 print STDERR "STDERR FROM SPOOL FILTER\n";
 
@@ -91,7 +98,7 @@ if (!$arguments{"file"}) {
   $arguments{"file"} = $file;
 }
 
-printf(STDERR "Got \%arguments: %s\n", Dumper(\%arguments));
+printf(STDERR "Got %%arguments: %s\n", Dumper(\%arguments));
 
 # Open up a zwrite command to announce the current track.
 my @zwrite_command = (qw(/usr/bin/zwrite -d -n -c), $zephyr_class, "-i", $queue.'@'.$host, "-s", "Gutenbach Music Spooler");
@@ -100,13 +107,16 @@ print STDERR "Invoking @zwrite_command\n";
 open(ZEPHYR, "|-", @zwrite_command) or die "Couldn't launch zwrite: $!";
 
 my $status;
+my $user = $arguments{"user"};
+my $userdesc;
 if (exists($arguments{"options"}{"job-originating-host-name"})) {
-    print(ZEPHYR $arguments{"user"},"\@",$arguments{"options"}{"job-originating-host-name"}," is playing:\n");
-    $status = "User: ".$arguments{"user"}."\@".$arguments{"options"}{"job-originating-host-name"};
+  my $ohost = $arguments{"options"}{"job-originating-host-name"};
+  $userdesc = "$user\@$ohost";
 } else {
-    print(ZEPHYR $arguments{"user"}," is playing:\n");
-    $status = "User: ".$arguments{"user"};
+  $userdesc = $user;
 }
+print ZEPHYR "$userdesc is playing:\n";
+$status = "User: $userdesc";
 
 # SIGHUP handler, in case we were aborted
 sub clear_status {
@@ -136,29 +146,35 @@ my ($title);
 
 open(STATUS, ">", "/var/run/gutenbach/status");
 
+my $do_playlist = defined($arguments{'options'}{'playlist'});
+
 if ($magic) {
   # $magic means that Image::ExifTool was able to identify the type of file
-  printf(ZEPHYR "%s file %s\n", $magic, $arguments{"job-title"});
-  #printf(STATUS $arguments{"job-title"});
-  $status .= sprintf(" Filetype: %s.", $magic);
-  $status .= sprintf(" Filename: %s.", $arguments{"job-title"});
+  my $job_title = $arguments{"job-title"};
+  print ZEPHYR "$magic file $job_title\n";
+  $status .= " Filetype: $magic.";
+  $status .= " Filename: $arguments{'job-title'}.";
   if (exists $fileinfo->{'Title'}) {
-      $title = $fileinfo->{'Title'};
-    printf(ZEPHYR "\@b{%s}\n", $fileinfo->{'Title'}) if exists $fileinfo->{'Title'};
-    printf(STATUS "%s\n", $fileinfo->{'Title'}) if exists $fileinfo->{'Title'};
-    $status .= sprintf(" Title: %s.", $fileinfo->{'Title'});
+    $title = $fileinfo->{'Title'};
+    print ZEPHYR "\@b{$title}\n";
+    print STATUS "$title\n";
+    $status .= " Title: $title.";
   }
   foreach my $key (qw/Artist Album AlbumArtist/) {
     if (exists $fileinfo->{$key}) {
-      printf(ZEPHYR "%s\n", $fileinfo->{$key}) if exists $fileinfo->{$key};
-      printf(STATUS "%s\n", $fileinfo->{$key}) if exists $fileinfo->{$key};
-      $status .= sprintf(" %s: %s\n", $key, $fileinfo->{$key});
+      my $val = $fileinfo->{$key};
+      print ZEPHYR "$val\n";
+      print STATUS "$val\n";
+      $status .= " $key: $val\n";
     }
   }
 
   $tempdir = tempdir();
   #awful hack -- geofft
   #== -- quentin
+  # this comment is probably inaccurate because we don't even use mplayer
+  # any more but idk -- bpchen
+
   # This code appears to create a new temporary directory and symlink
   # the job file into the temporary directory under the original
   # filename. I think this is because mplayer sometimes uses the file
@@ -167,25 +183,49 @@ if ($magic) {
   symlink($filepath, $newpath);
   $filepath = $newpath;
 }
-elsif ($arguments{copies} == 42) {
+elsif ($arguments{copies} == $COPIES_SENTINEL) {
   # This is a flag that is set by jobs queued by split_playlist(); it tells us to not try to split the playlist again.
   # Call resolve_external_reference to apply some heuristics to determine the filetype.
   $filepath = resolve_external_reference($filepath, \%arguments);
-  if ($filepath =~ m|http://www\.youtube\.com/watch\?v=|) {
+  if ($do_playlist) {
+    my @json_args = ("-j", "--flat-playlist");
+    if (defined($arguments{'options'}{'playlist-start'})) {
+      push @json_args, '--playlist-start', $arguments{'options'}{'playlist-start'};
+    }
+    if (defined($arguments{'options'}{'playlist-end'})) {
+      push @json_args, '--playlist-end', $arguments{'options'}{'playlist-end'};
+    }
+    $pid = open(YTDL_JSONS, "-|", "/usr/local/bin/youtube-dl", @json_args, $filepath) or die "Unable to invoke youtube-dl";
+    print ZEPHYR "YouTube playlist $filepath\n";
+    $status .= " YouTube playlist $filepath.";
+    while (<YTDL_JSONS>) {
+      # this is the wrong way to get these IDs, but I can't find a right way
+      # that doesn't involve parsing JSON, which seems like too heavyweight a
+      # dependency (--get-id doesn't work??) --bpchen
+      m/"id": "([-0-9a-zA-Z_]+)"/;
+      print ZEPHYR "  enqueueing YouTube video /watch?v=$1\n";
+      enqueue_url("https://www.youtube.com/watch?v=$1");
+    }
+  } elsif (is_youtube_url($filepath)) {
     # YouTube URLs are resolved by the youtube-dl command.
-    # Launch youtube-dl
-    $pid = open(YTDL, "-|", "youtube-dl","-b", "-g", $filepath) or die "Unable to invoke youtube-dl";
-	print ZEPHYR "YouTube video $filepath\n$title";
-	$status .= " YouTube video $filepath. $title.";
-	# youtube-dl prints the URL of the flash video, which we pass to mplayer as a filename.
-	$filepath = <YTDL>;
-	chomp $filepath;
 
+    # Launch youtube-dl, first just to get the title...
+    $pid = open(YTDL_TITLE, "-|", "/usr/local/bin/youtube-dl", "--no-playlist", "--get-title", $filepath) or die "Unable to invoke youtube-dl";
+    $title = <YTDL_TITLE>;
+    chomp $title;
 
+    # ...then to get the URL.
+    $pid = open(YTDL, "-|", "/usr/local/bin/youtube-dl", "--format", "bestaudio/best", "--no-playlist", "--get-url", $filepath) or die "Unable to invoke youtube-dl";
+    print ZEPHYR "YouTube video $filepath\n$title";
+    $status .= " YouTube video $filepath. $title.";
+
+    # Finally, pass the URL to vlc as a filename.
+    $filepath = <YTDL>;
+    chomp $filepath;
   } else { # Doesn't appear to be a YouTube URL.
     print STDERR "Resolved external reference to $filepath\n";
-    printf(ZEPHYR "%s\n", $filepath);
-    $status .= sprintf(" External: %s\n", $filepath);
+    print ZEPHYR "$filepath\n";
+    $status .= " External: $filepath\n";
   }
 }
 elsif (-T $filepath) { # If the file appears to be a text file, treat it as a playlist.
@@ -196,15 +236,39 @@ elsif (-T $filepath) { # If the file appears to be a text file, treat it as a pl
   exit 0;
 }
 
+my $start = extract_time_option('Start', @start_synonyms);
+my $stop  = extract_time_option('Stop' , @stop_synonyms );
+
 close(ZEPHYR);
 close(STATUS);
 print CUPS "NOTICE: $status\n";
-play_mplayer_audio($filepath, \%arguments);
+play_audio($filepath, \%arguments);
 
 # Remove the symlink we made earlier for the filetype.
 if ($magic) {
   unlink($newpath);
   rmdir($tempdir);
+}
+
+# -=-=-=-=-= subroutines start below =-=-=-=-=-
+
+sub extract_time_option {
+  my $label = shift;
+  foreach (@_) {
+    if (defined($arguments{'options'}{$_})) {
+      my $res = parse_time_interval($arguments{'options'}{$_});
+      print ZEPHYR "\n$label time: ${res} seconds";
+      return $res;
+    }
+  }
+  return undef;
+}
+
+sub is_youtube_url {
+  $_ = shift;
+  return m{https?://(?:www|m)\.youtube\.com/watch\?v=}
+    || m{https?://www.youtube.com/v/}
+    || m{https?://youtu.be/};
 }
 
 # Play an external stream reference
@@ -219,7 +283,7 @@ sub resolve_external_reference {
     # Take the leading non-whitespace as a URL
     $uri=$1;
 
-    if ($uri =~ m|http://www\.youtube\.com/watch\?v=|) {
+    if (is_youtube_url($uri)) {
       return $uri;
     }
 
@@ -238,7 +302,7 @@ sub resolve_external_reference {
     }
   } else { # Unable to match the URL regex
     print ZEPHYR "Couldn't read URI for external reference\n";
-    # Return the existing path, in the hopes that mplayer knows what to do with it.
+    # Return the existing path, in the hopes that vlc knows what to do with it.
     return $filepath;
   }
 
@@ -253,6 +317,27 @@ sub resolve_external_reference {
   return $uri;
 }
 
+sub enqueue_url {
+  my ($url, $start_time, $stop_time, $do_playlist, $playlist_start, $playlist_end) = @_;
+  $ENV{CUPS_SERVER}='localhost';
+  my @lpargs = ('-d', "$queue", "-n", "$COPIES_SENTINEL");
+  if (defined($start_time )) { push @lpargs, '-o', "start=$start_time"; }
+  if (defined($stop_time  )) { push @lpargs, '-o', "stop=$stop_time"  ; }
+  if (defined($do_playlist)) { push @lpargs, '-o', "playlist=1"       ; }
+  if (defined($playlist_start)) { push @lpargs, '-o', "playlist-start=$playlist_start"; }
+  if (defined($playlist_end))   { push @lpargs, '-o', "playlist-end=$playlist_end"    ; }
+
+  open(LP, '|-', 'lp', @lpargs);
+  print LP $url;
+  close(LP);
+}
+
+sub process_playlist_line {
+  my ($line, $url, $start_time, $stop_time, $do_playlist, $playlist_start, $playlist_end) = @_;
+  print STDERR "Found playlist line: $line\n";
+  enqueue_url($url, $start_time, $stop_time, $do_playlist, $playlist_start, $playlist_end);
+}
+
 sub split_playlist {
   my ($file, $arguments) = @_;
 
@@ -261,12 +346,21 @@ sub split_playlist {
   open(FILE, "<", $filepath) or die "Couldn't open spool file";
   while (<FILE>) {
     chomp;
-    if (/^([^#]\S+)/) {
-      printf (STDERR "Found playlist line: %s\n", $_);
-      $ENV{CUPS_SERVER}='localhost';
-      open(LP, "|-", "lp", "-d", "$queue", "-n", "42"); #'-#', '42', '-J', $arguments->{"job-title"}, '-o', 'job-priority=100');
-      print LP $1;
-      close(LP);
+    # first attempt to notice and parse special YouTube URL parameters
+    if (/^([^#]+)#t=(\d+)/) {
+      # url#t=123
+      process_playlist_line($_, $1, $2);
+      $i++;
+    } elsif (/^([^#?&]+)\?(?:start|t)=(\d+)(?:&end=(\d+))?/) {
+      # url?t=17 url?start=17 url?start=40&end=123
+      process_playlist_line($_, $1, $2, $3);
+      $i++;
+    } elsif (/^([^#]\S+)(?:\s+playlist)(?:\s+(?:$start_ors)=(\S+))?(?:\s+(?:$stop_ors)=(\S+))?/) {
+      process_playlist_line($_, $1, undef, undef, 1, $2, $3);
+      $i++;
+    } elsif (/^([^#]\S+)(?:\s+(?:$start_ors)=(\S+))?(?:\s+(?:$stop_ors)=(\S+))?/) {
+      # our syntax, space-separated and stuff
+      process_playlist_line($_, $1, $2, $3);
       $i++;
     }
   }
@@ -297,15 +391,15 @@ sub get_shoutcast {
   return $uris[$server];
 }
 
-sub play_mplayer_audio {
+sub play_audio {
   my ($filepath, $opts) = @_;
 
-  # Open up a zwrite command to show the mplayer output
+  # Open up a zwrite command to show the vlc output
   my @zwrite_command = (qw(/usr/bin/zwrite -d -n -c), $zephyr_class, "-i", $queue.'@'.$host, "-s", "Gutenbach Music Spooler");
 
-  print STDERR "Invoking (from play_mplayer_audio): @zwrite_command\n";
+  print STDERR "Invoking (from play_audio): @zwrite_command\n";
 
-  # fork for mplayer
+  # fork for vlc
   $pid = open(MP3STATUS, "-|");
   unless (defined $pid) {
     open(ZEPHYR, "|-", @zwrite_command) or die "Couldn't launch zwrite: $!";
@@ -316,12 +410,10 @@ sub play_mplayer_audio {
 
   if ($pid) { #parent
     # Check if there were any errors
-    if ($_ = <MP3STATUS>) {
+    if ($_ = do {local $/; <MP3STATUS>}) {
       open(ZEPHYR, "|-", @zwrite_command) or die "Couldn't launch zwrite: $!";
       print ZEPHYR "Playback completed with the following errors:\n";
-      while (<MP3STATUS>) {
-	print ZEPHYR $_;
-      }
+      print ZEPHYR $_;
       close(ZEPHYR);
     } else {
       open(ZEPHYR, "|-", @zwrite_command) or die "Couldn't launch zwrite: $!";
@@ -331,18 +423,34 @@ sub play_mplayer_audio {
       print(STATUS "");
       close(STATUS);
     }
-    close(MP3STATUS) || print ZEPHYR "mplayer exited $?\n";
+    close(MP3STATUS) || print ZEPHYR "vlc exited $?\n";
   }
   else { # child
     # redirect STDERR to STDOUT
     open STDERR, '>&STDOUT';
-    # make sure that mplayer doesn't try to intepret the file as keyboard input
+    # make sure that vlc doesn't try to intepret the file as keyboard input?
     close(STDIN);
     open(STDIN, "/dev/null");
 
-    my @args = (qw|/usr/bin/mplayer -vo fbdev2 -zoom -x 1024 -y 768 -framedrop -nolirc -cache 512 -ao alsa -really-quiet |, $filepath);
-    #pint STDERR "About to exec: ", Dumper([@args]);
+    my @args = (qw{/usr/bin/vlc --quiet --play-and-exit --http-reconnect -I http --http-password}, $http_password, qw{--aout alsa --alsa-audio-device hw --no-video}, $filepath);
+    if (defined($start)) { push @args, '--start-time', $start; }
+    if (defined($stop )) { push @args, '--stop-time' , $stop ; }
+
+    # print STDERR "About to exec: ", Dumper([@args]);
     exec(@args) ||
       die "Couldn't exec";
   }
 }
+
+sub parse_time_interval {
+  my $arg = shift;
+  # matches things like 4:33, 4m33, 4m33s, 4m
+  if ($arg =~ /^(\d+)[m:](?:(\d+)s?)?$/i) {
+    return $1 * 60 + ($2 or 0);
+  } elsif (looks_like_number($arg)) {
+    return 0 + $arg;
+  } else {
+    return undef;
+  }
+}
+# vim:set et ts=2 sw=2 sts=2:
