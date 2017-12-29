@@ -185,8 +185,7 @@ if ($magic) {
 }
 elsif ($arguments{copies} == $COPIES_SENTINEL) {
   # This is a flag that is set by jobs queued by split_playlist(); it tells us to not try to split the playlist again.
-  # Call resolve_external_reference to apply some heuristics to determine the filetype.
-  $filepath = resolve_external_reference($filepath, \%arguments);
+  $filepath = get_url($filepath);
   if ($do_playlist) {
     my @json_args = ("-j", "--flat-playlist");
     if (defined($arguments{'options'}{'playlist-start'})) {
@@ -206,26 +205,24 @@ elsif ($arguments{copies} == $COPIES_SENTINEL) {
       print ZEPHYR "  enqueueing YouTube video /watch?v=$1\n";
       enqueue_url("https://www.youtube.com/watch?v=$1");
     }
-  } elsif (is_youtube_url($filepath)) {
-    # YouTube URLs are resolved by the youtube-dl command.
-
+  } else {
     # Launch youtube-dl, first just to get the title...
-    $pid = open(YTDL_TITLE, "-|", "/usr/local/bin/youtube-dl", "--no-playlist", "--get-title", $filepath) or die "Unable to invoke youtube-dl";
+    $pid = open(YTDL_TITLE, "-|", "/usr/local/bin/youtube-dl", "--no-playlist", "--get-title", $filepath) or die "Unable to invoke youtube-dl get-title";
     $title = <YTDL_TITLE>;
+    close(YTDL_TITLE);
+    die "youtube-dl get-title returned nonzero exit code" if $?;
     chomp $title;
 
     # ...then to get the URL.
-    $pid = open(YTDL, "-|", "/usr/local/bin/youtube-dl", "--format", "bestaudio/best", "--no-playlist", "--get-url", $filepath) or die "Unable to invoke youtube-dl";
-    print ZEPHYR "YouTube video $filepath\n$title";
-    $status .= " YouTube video $filepath. $title.";
+    $pid = open(YTDL, "-|", "/usr/local/bin/youtube-dl", "--format", "bestaudio/best", "--no-playlist", "--get-url", $filepath) or die "Unable to invoke youtube-dl get-url";
+    print ZEPHYR "URL $filepath\n$title";
+    $status .= " URL $filepath. $title.";
 
     # Finally, pass the URL to vlc as a filename.
     $filepath = <YTDL>;
+    close(YTDL);
+    die "youtube-dl get-url returned nonzero exit code" if $?;
     chomp $filepath;
-  } else { # Doesn't appear to be a YouTube URL.
-    print STDERR "Resolved external reference to $filepath\n";
-    print ZEPHYR "$filepath\n";
-    $status .= " External: $filepath\n";
   }
 }
 elsif (-T $filepath) { # If the file appears to be a text file, treat it as a playlist.
@@ -264,57 +261,19 @@ sub extract_time_option {
   return undef;
 }
 
-sub is_youtube_url {
-  $_ = shift;
-  return m{https?://(?:www|m)\.youtube\.com/watch\?v=}
-    || m{https?://www.youtube.com/v/}
-    || m{https?://youtu.be/};
-}
-
-# Play an external stream reference
-sub resolve_external_reference {
-  # Retrieve those command line opts.
-  my ($filepath, $arguments) = @_;
-
-  my ($format, $uri, $userpass);
+# Tries to get url from first line of file
+sub get_url {
+  my $filepath = shift;
 
   open(FILE, "<", $filepath) or die "Couldn't open spool file";
   if (<FILE> =~ /^(\S+)/) {
-    # Take the leading non-whitespace as a URL
-    $uri=$1;
-
-    if (is_youtube_url($uri)) {
-      return $uri;
-    }
-
-    # Fetch the URL with a HEAD request to get the content type
-    my $response = $ua->head($uri);
-
-    my $contenttype=($response->content_type() or "unknown");
-
-    if ($contenttype eq "audio/mpeg") { $format="MP3" }
-    elsif ($contenttype eq "application/x-ogg") { $format="OGG" }
-    elsif ($contenttype eq "application/ogg") { $format="OGG" }
-    elsif ($contenttype eq "audio/x-scpls") { $format="SHOUTCAST" }
-    else {
-      print ZEPHYR
-	"Unknown Content-Type $contenttype for URI $uri\n";
-    }
+    # Return the leading non-whitespace as a URL
+    return $1;
   } else { # Unable to match the URL regex
-    print ZEPHYR "Couldn't read URI for external reference\n";
+    print ZEPHYR "Couldn't find URL in spool file\n";
     # Return the existing path, in the hopes that vlc knows what to do with it.
     return $filepath;
   }
-
-  if ($format eq "SHOUTCAST") {
-    print ZEPHYR "Shoutcast playlist...\n";
-    return get_shoutcast($uri);
-  } elsif ($format eq "MP3") {
-  } elsif ($format eq "OGG") {
-  } else {
-    print ZEPHYR "Unrecognized stream format: $format\n";
-  }
-  return $uri;
 }
 
 sub enqueue_url {
@@ -365,30 +324,6 @@ sub split_playlist {
     }
   }
   printf(ZEPHYR "Playlist containing %d valid entries, split into separate jobs.\n", $i);
-}
-
-# Process a Shoutcast playlist
-# get_shoutcast(URI)
-sub get_shoutcast {
-  my $uri = shift(@_);
-
-  my $response = $ua->get($uri);
-  my (@titles, @uris);
-
-  foreach (split("\n", $response->content())) {
-      if (/^File\d+=(\S+)/) {
-	  push(@uris, $1);
-      }
-      if (/^Title\d+=(.+)$/) {
-	  push(@titles, $1);
-      }
-  }
-
-  # choose a random server
-  my $server = int(rand scalar(@uris));
-  # print the name of the stream if available
-  print ZEPHYR "$titles[$server]\n";
-  return $uris[$server];
 }
 
 sub play_audio {
