@@ -194,7 +194,7 @@ elsif ($arguments{copies} == $COPIES_SENTINEL) {
     if (defined($arguments{'options'}{'playlist-end'})) {
       push @json_args, '--playlist-end', $arguments{'options'}{'playlist-end'};
     }
-    $pid = open(YTDL_JSONS, "-|", "/usr/local/bin/youtube-dl", @json_args, $filepath) or die "Unable to invoke youtube-dl";
+    $pid = open(YTDL_JSONS, "-|", "/usr/bin/python3", "/usr/local/bin/youtube-dl", @json_args, $filepath) or die "Unable to invoke youtube-dl";
     print ZEPHYR "YouTube playlist $filepath\n";
     $status .= " YouTube playlist $filepath.";
     while (<YTDL_JSONS>) {
@@ -207,14 +207,14 @@ elsif ($arguments{copies} == $COPIES_SENTINEL) {
     }
   } else {
     # Launch youtube-dl, first just to get the title...
-    $pid = open(YTDL_TITLE, "-|", "/usr/local/bin/youtube-dl", "--no-playlist", "--get-title", $filepath) or die "Unable to invoke youtube-dl get-title";
+    $pid = open(YTDL_TITLE, "-|", "/usr/bin/python3", "/usr/local/bin/youtube-dl", "--no-playlist", "--get-title", $filepath) or die "Unable to invoke youtube-dl get-title";
     $title = <YTDL_TITLE>;
     close(YTDL_TITLE);
     die "youtube-dl get-title returned nonzero exit code" if $?;
     chomp $title;
 
     # ...then to get the URL.
-    $pid = open(YTDL, "-|", "/usr/local/bin/youtube-dl", "--format", "bestaudio/best", "--no-playlist", "--get-url", $filepath) or die "Unable to invoke youtube-dl get-url";
+    $pid = open(YTDL, "-|", "/usr/bin/python3", "/usr/local/bin/youtube-dl", "--format", "bestaudio/best", "--no-playlist", "--get-url", $filepath) or die "Unable to invoke youtube-dl get-url";
     print ZEPHYR "URL $filepath\n$title";
     $status .= " URL $filepath. $title.";
 
